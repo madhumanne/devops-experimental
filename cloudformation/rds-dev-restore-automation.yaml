@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated RDS PostgreSQL Dev Database Restoration from Production Snapshots'
+
+Parameters:
+  SourceDBIdentifier:
+    Type: String
+    Default: 'prod-orbitshift-m6g-2xl'
+    Description: 'Production database identifier to restore from'
+  
+  TargetDBIdentifier:
+    Type: String
+    Default: 'dev-orbitshift-postgres'
+    Description: 'Development database identifier to restore to'
+  
+  TargetDBInstanceClass:
+    Type: String
+    Default: 'db.t4g.large'
+    Description: 'Instance class for the development database'
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+      - db.t4g.xlarge
+      - db.t4g.2xlarge
+  
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 0 ? * SUN *)'
+    Description: 'EventBridge cron expression for restore schedule (default: Sunday 12 AM UTC)'
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+    Description: 'Lambda function timeout in seconds (max 15 minutes)'
+
+Resources:
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RDSRestorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                  - 'rds:DescribeDBSnapshots'
+                  - 'rds:RestoreDBInstanceFromDBSnapshot'
+                  - 'rds:DeleteDBInstance'
+                  - 'rds:ModifyDBInstance'
+                  - 'rds:AddTagsToResource'
+                  - 'rds:ListTagsForResource'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeSecurityGroups'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-role'
+        - Key: Purpose
+          Value: 'RDS Dev Database Restoration'
+
+  # Lambda Function
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-rds-restore'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          SOURCE_DB_IDENTIFIER: !Ref SourceDBIdentifier
+          TARGET_DB_IDENTIFIER: !Ref TargetDBIdentifier
+          TARGET_DB_INSTANCE_CLASS: !Ref TargetDBInstanceClass
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          import logging
+          from datetime import datetime
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize boto3 clients
+          rds_client = boto3.client('rds')
+          
+          # Environment variables
+          SOURCE_DB_IDENTIFIER = os.environ['SOURCE_DB_IDENTIFIER']
+          TARGET_DB_IDENTIFIER = os.environ['TARGET_DB_IDENTIFIER']
+          TARGET_DB_INSTANCE_CLASS = os.environ['TARGET_DB_INSTANCE_CLASS']
+          
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler function to restore dev database from production snapshot.
+              """
+              try:
+                  logger.info(f"Starting RDS restore process")
+                  logger.info(f"Source DB: {SOURCE_DB_IDENTIFIER}")
+                  logger.info(f"Target DB: {TARGET_DB_IDENTIFIER}")
+                  logger.info(f"Target Instance Class: {TARGET_DB_INSTANCE_CLASS}")
+                  
+                  # Step 1: Get production database configuration
+                  logger.info("Step 1: Fetching production database configuration")
+                  prod_db_config = get_db_configuration(SOURCE_DB_IDENTIFIER)
+                  
+                  # Step 2: Find the latest snapshot
+                  logger.info("Step 2: Finding latest snapshot")
+                  snapshot_id = get_latest_snapshot(SOURCE_DB_IDENTIFIER)
+                  
+                  if not snapshot_id:
+                      raise Exception(f"No snapshots found for database: {SOURCE_DB_IDENTIFIER}")
+                  
+                  logger.info(f"Latest snapshot found: {snapshot_id}")
+                  
+                  # Step 3: Check if target database exists and delete if necessary
+                  logger.info("Step 3: Checking if target database exists")
+                  if check_db_exists(TARGET_DB_IDENTIFIER):
+                      logger.info(f"Target database {TARGET_DB_IDENTIFIER} exists. Initiating deletion...")
+                      delete_db_instance(TARGET_DB_IDENTIFIER)
+                      logger.info(f"Target database {TARGET_DB_IDENTIFIER} deleted successfully")
+                  else:
+                      logger.info(f"Target database {TARGET_DB_IDENTIFIER} does not exist. Proceeding with restore.")
+                  
+                  # Step 4: Restore database from snapshot
+                  logger.info("Step 4: Restoring database from snapshot")
+                  restore_db_from_snapshot(
+                      snapshot_id=snapshot_id,
+                      target_db_identifier=TARGET_DB_IDENTIFIER,
+                      db_instance_class=TARGET_DB_INSTANCE_CLASS,
+                      db_subnet_group=prod_db_config['db_subnet_group'],
+                      vpc_security_groups=prod_db_config['vpc_security_groups']
+                  )
+                  
+                  logger.info(f"Database restoration initiated successfully")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Database restoration initiated successfully',
+                          'snapshot_id': snapshot_id,
+                          'target_db': TARGET_DB_IDENTIFIER
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error during restoration process: {str(e)}", exc_info=True)
+                  raise
+          
+          def get_db_configuration(db_identifier):
+              """
+              Get configuration details from the production database.
+              """
+              try:
+                  response = rds_client.describe_db_instances(
+                      DBInstanceIdentifier=db_identifier
+                  )
+                  
+                  if not response['DBInstances']:
+                      raise Exception(f"Database {db_identifier} not found")
+                  
+                  db_instance = response['DBInstances'][0]
+                  
+                  # Extract VPC security group IDs
+                  vpc_security_groups = [sg['VpcSecurityGroupId'] for sg in db_instance.get('VpcSecurityGroups', [])]
+                  
+                  config = {
+                      'db_subnet_group': db_instance.get('DBSubnetGroup', {}).get('DBSubnetGroupName'),
+                      'vpc_security_groups': vpc_security_groups
+                  }
+                  
+                  logger.info(f"Production DB configuration: {config}")
+                  return config
+                  
+              except Exception as e:
+                  logger.error(f"Error getting DB configuration: {str(e)}")
+                  raise
+          
+          def get_latest_snapshot(db_identifier):
+              """
+              Find the latest automated or manual snapshot for the given database.
+              """
+              try:
+                  # Get all snapshots for the database
+                  response = rds_client.describe_db_snapshots(
+                      DBInstanceIdentifier=db_identifier,
+                      SnapshotType='automated'
+                  )
+                  
+                  automated_snapshots = response.get('DBSnapshots', [])
+                  
+                  # Also check for manual snapshots
+                  response = rds_client.describe_db_snapshots(
+                      DBInstanceIdentifier=db_identifier,
+                      SnapshotType='manual'
+                  )
+                  
+                  manual_snapshots = response.get('DBSnapshots', [])
+                  
+                  # Combine all snapshots
+                  all_snapshots = automated_snapshots + manual_snapshots
+                  
+                  # Filter only available snapshots
+                  available_snapshots = [
+                      s for s in all_snapshots 
+                      if s['Status'] == 'available'
+                  ]
+                  
+                  if not available_snapshots:
+                      return None
+                  
+                  # Sort by creation time and get the latest
+                  latest_snapshot = sorted(
+                      available_snapshots,
+                      key=lambda x: x['SnapshotCreateTime'],
+                      reverse=True
+                  )[0]
+                  
+                  logger.info(f"Latest snapshot: {latest_snapshot['DBSnapshotIdentifier']} "
+                            f"created at {latest_snapshot['SnapshotCreateTime']}")
+                  
+                  return latest_snapshot['DBSnapshotIdentifier']
+                  
+              except Exception as e:
+                  logger.error(f"Error finding latest snapshot: {str(e)}")
+                  raise
+          
+          def check_db_exists(db_identifier):
+              """
+              Check if a database instance exists.
+              """
+              try:
+                  response = rds_client.describe_db_instances(
+                      DBInstanceIdentifier=db_identifier
+                  )
+                  return len(response['DBInstances']) > 0
+              except rds_client.exceptions.DBInstanceNotFoundFault:
+                  return False
+              except Exception as e:
+                  logger.error(f"Error checking if DB exists: {str(e)}")
+                  raise
+          
+          def delete_db_instance(db_identifier):
+              """
+              Delete the database instance and wait for deletion to complete.
+              """
+              try:
+                  # Delete the database without creating a final snapshot
+                  logger.info(f"Deleting database instance: {db_identifier}")
+                  rds_client.delete_db_instance(
+                      DBInstanceIdentifier=db_identifier,
+                      SkipFinalSnapshot=True,
+                      DeleteAutomatedBackups=True
+                  )
+                  
+                  # Wait for deletion to complete
+                  logger.info(f"Waiting for database {db_identifier} to be deleted...")
+                  waiter = rds_client.get_waiter('db_instance_deleted')
+                  waiter.wait(
+                      DBInstanceIdentifier=db_identifier,
+                      WaiterConfig={
+                          'Delay': 30,  # Check every 30 seconds
+                          'MaxAttempts': 60  # Wait up to 30 minutes
+                      }
+                  )
+                  
+                  logger.info(f"Database {db_identifier} deleted successfully")
+                  
+              except Exception as e:
+                  logger.error(f"Error deleting database instance: {str(e)}")
+                  raise
+          
+          def restore_db_from_snapshot(snapshot_id, target_db_identifier, db_instance_class, 
+                                      db_subnet_group, vpc_security_groups):
+              """
+              Restore database from snapshot with specified configuration.
+              """
+              try:
+                  logger.info(f"Restoring database {target_db_identifier} from snapshot {snapshot_id}")
+                  
+                  restore_params = {
+                      'DBInstanceIdentifier': target_db_identifier,
+                      'DBSnapshotIdentifier': snapshot_id,
+                      'DBInstanceClass': db_instance_class,
+                      'PubliclyAccessible': False,
+                      'Tags': [
+                          {
+                              'Key': 'Environment',
+                              'Value': 'Development'
+                          },
+                          {
+                              'Key': 'RestoredFrom',
+                              'Value': snapshot_id
+                          },
+                          {
+                              'Key': 'RestoredAt',
+                              'Value': datetime.utcnow().isoformat()
+                          }
+                      ]
+                  }
+                  
+                  # Add subnet group if available
+                  if db_subnet_group:
+                      restore_params['DBSubnetGroupName'] = db_subnet_group
+                  
+                  # Add VPC security groups if available
+                  if vpc_security_groups:
+                      restore_params['VpcSecurityGroupIds'] = vpc_security_groups
+                  
+                  response = rds_client.restore_db_instance_from_db_snapshot(**restore_params)
+                  
+                  logger.info(f"Restore initiated. Database will be available shortly.")
+                  logger.info(f"DB Instance ARN: {response['DBInstance']['DBInstanceArn']}")
+                  
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Error restoring database from snapshot: {str(e)}")
+                  raise
+      Description: 'Lambda function to restore dev RDS database from production snapshot'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda'
+        - Key: Purpose
+          Value: 'RDS Dev Database Restoration'
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-rds-restore'
+      RetentionInDays: 30
+
+  # EventBridge Rule for Scheduled Execution
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-scheduled-restore'
+      Description: 'Trigger RDS dev database restoration on schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: LambdaTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  # CloudWatch Alarm for Lambda Errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: 'Alert when Lambda function encounters errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunction
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-arn'
+
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-name'
+
+  EventBridgeRuleArn:
+    Description: 'ARN of the EventBridge rule'
+    Value: !GetAtt ScheduledRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-rule-arn'
+
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-role-arn'
+
+  LogGroupName:
+    Description: 'CloudWatch Log Group name'
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-log-group'
