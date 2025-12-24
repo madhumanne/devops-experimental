@@ -84,13 +84,6 @@ Resources:
         - Key: Purpose
           Value: 'RDS Dev Database Restoration'
 
-  # CloudWatch Log Group for Lambda
-  LambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${LambdaFunction}'
-      RetentionInDays: 30
-
   # Lambda Function
   LambdaFunction:
     Type: AWS::Lambda::Function
@@ -358,6 +351,13 @@ Resources:
           Value: !Sub '${AWS::StackName}-lambda'
         - Key: Purpose
           Value: 'RDS Dev Database Restoration'
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-rds-restore'
+      RetentionInDays: 30
 
   # EventBridge Rule for Scheduled Execution
   ScheduledRule:
